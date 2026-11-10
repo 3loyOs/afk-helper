@@ -53,6 +53,10 @@ DEFAULT_CONFIG = {
     "clickers": {"left": {"interval_ms": 100, "key": "F6"},
                  "right": {"interval_ms": 200, "key": "F7"}},
     "click_jitter_pct": 10,
+    "walk_enabled": False,
+    "walk_steps": [{"key": "W", "ms": 300}, {"key": "A", "ms": 300},
+                   {"key": "S", "ms": 300}, {"key": "D", "ms": 300}],
+    "walk_gap_ms": 100,
     "notify": True,
     "binds": [
         {"key": "KP5", "text": "/airdrop info", "enabled": True,
@@ -226,6 +230,10 @@ def load_config():
     for side in clickers:
         clickers[side].update((cfg.get("clickers") or {}).get(side, {}))
     cfg["clickers"] = clickers
+    steps = cfg.get("walk_steps")
+    if not (isinstance(steps, list) and len(steps) == 4
+            and all(isinstance(s, dict) and "key" in s and "ms" in s for s in steps)):
+        cfg["walk_steps"] = json.loads(json.dumps(DEFAULT_CONFIG["walk_steps"]))
     return cfg
 
 
@@ -555,6 +563,41 @@ class App:
                         ).pack(side="left", padx=12)
 
         # --- чат
+        wk = ttk.LabelFrame(self.tab_afk, text="Ходьба по кругу", padding=8)
+        wk.pack(fill="x", pady=4)
+        self.walk_var = tk.BooleanVar(value=bool(self.cfg.get("walk_enabled", False)))
+        ttk.Checkbutton(wk, text="Ходить при каждом срабатывании AFK-режима", variable=self.walk_var,
+                        command=lambda: self.set_cfg("walk_enabled", self.walk_var.get())
+                        ).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 4))
+        self.walk_key_lbls = []
+        for i, st in enumerate(self.cfg["walk_steps"]):
+            row = i + 1
+            ttk.Label(wk, text="Шаг %d" % (i + 1)).grid(row=row, column=0, sticky="w", pady=2)
+            kl = ttk.Label(wk, text=st["key"], width=10, relief="sunken", anchor="center")
+            kl.grid(row=row, column=1, padx=6)
+            ttk.Button(wk, text="Назначить",
+                       command=lambda i=i: self.assign_walk_key(i)).grid(row=row, column=2)
+            var = tk.StringVar(value=str(st["ms"]))
+            ttk.Spinbox(wk, from_=10, to=10000, increment=50, width=7,
+                        textvariable=var).grid(row=row, column=3, padx=(10, 2))
+            var.trace_add("write", lambda *a, i=i, v=var: self.on_walk_ms(i, v))
+            ttk.Label(wk, text="мс удержания").grid(row=row, column=4, sticky="w")
+            self.walk_key_lbls.append(kl)
+        gf = ttk.Frame(wk)
+        gf.grid(row=5, column=0, columnspan=5, sticky="w", pady=(6, 0))
+        ttk.Label(gf, text="Пауза между шагами").pack(side="left")
+        gvar = tk.StringVar(value=str(self.cfg.get("walk_gap_ms", 100)))
+        ttk.Spinbox(gf, from_=0, to=5000, increment=50, width=7, textvariable=gvar).pack(side="left", padx=4)
+        gvar.trace_add("write", lambda *a: self.on_num("walk_gap_ms", gvar, int, 0, 5000))
+        ttk.Label(gf, text="мс").pack(side="left")
+        ttk.Button(gf, text="Тест ходьбы (через 3 сек)", command=self.test_walk).pack(side="left", padx=12)
+        ttk.Label(wk, foreground="gray", justify="left",
+                  text="По умолчанию W A S D — это те же клавиши, что Ц Ф Ы В: программа жмёт\n"
+                       "физические кнопки, раскладка не важна. Вперёд → влево → назад → вправо\n"
+                       "с одинаковой длительностью возвращает персонажа примерно на место.\n"
+                       "Круг мышью и ходьбу можно включать вместе или по отдельности."
+                  ).grid(row=6, column=0, columnspan=5, sticky="w", pady=(6, 0))
+
         ck = ttk.LabelFrame(self.tab_click, text="Автокликер", padding=8)
         ck.pack(fill="x", pady=4)
         self.click_key_lbls, self.click_status_lbls = {}, {}
@@ -1271,9 +1314,9 @@ class App:
     def tick(self):
         if self.enabled:
             parts = []
-            if self.cfg.get("circle_enabled", True):
+            if self.cfg.get("circle_enabled", True) or self.cfg.get("walk_enabled", False):
                 left = max(0, int(self.next_move - time.time()))
-                parts.append("круг через %d:%02d" % (left // 60, left % 60))
+                parts.append("движение через %d:%02d" % (left // 60, left % 60))
             if self.auto_next:
                 parts.append("автокоманд: %d" % len(self.auto_next))
             self.countdown_lbl.config(text=" · ".join(parts))
@@ -1284,15 +1327,75 @@ class App:
 
     def afk_loop(self):
         while not self.stop_event.is_set():
-            if (self.enabled and self.vi and self.cfg.get("circle_enabled", True)
+            circle = self.cfg.get("circle_enabled", True)
+            walk = self.cfg.get("walk_enabled", False)
+            if (self.enabled and self.vi and (circle or walk)
                     and time.time() >= self.next_move):
-                try:
-                    self.vi.circle(self.cfg["radius"], self.cfg["circle_duration"])
-                    self.q.put(("log", "Круг мышью"))
-                except Exception as ex:
-                    self.q.put(("log", "Ошибка движения мыши: %s" % ex))
+                if circle:
+                    try:
+                        self.vi.circle(self.cfg["radius"], self.cfg["circle_duration"])
+                        self.q.put(("log", "Круг мышью"))
+                    except Exception as ex:
+                        self.q.put(("log", "Ошибка движения мыши: %s" % ex))
+                if walk and self.enabled:
+                    if self.app_focused:
+                        self.q.put(("log", "Ходьба пропущена: активно окно программы"))
+                    else:
+                        self.do_walk()
                 self.schedule_next()
             time.sleep(0.2)
+
+    def do_walk(self):
+        """Шаги по очереди. Держит typing_lock, чтобы не смешаться с печатью в чат."""
+        got = self.typing_lock.acquire(timeout=10)
+        try:
+            done = []
+            for st in self.cfg.get("walk_steps", []):
+                if self.stop_event.is_set():
+                    break
+                code = resolve_key(st.get("key", ""))
+                if code is None:
+                    continue
+                self.vi.press_combo([], code, max(10, int(st.get("ms", 300))) / 1000.0)
+                done.append(st["key"])
+                time.sleep(self.cfg.get("walk_gap_ms", 100) / 1000.0)
+            self.q.put(("log", "Ходьба: " + " → ".join(done)))
+        except Exception as ex:
+            self.q.put(("log", "Ошибка ходьбы: %s" % ex))
+        finally:
+            if got:
+                self.typing_lock.release()
+
+    def test_walk(self):
+        if not self.vi:
+            return
+        self.log("Тестовая ходьба через 3 секунды — переключитесь в игру…")
+
+        def run():
+            time.sleep(3)
+            self.do_walk()
+        threading.Thread(target=run, daemon=True).start()
+
+    def assign_walk_key(self, i):
+        lbl = self.walk_key_lbls[i]
+
+        def done(combo, name):
+            if name != "ESC":
+                if resolve_key(name) is None:
+                    messagebox.showwarning(APP_NAME, "Эту клавишу нельзя использовать для ходьбы.")
+                else:
+                    self.cfg["walk_steps"][i]["key"] = name
+                    save_config(self.cfg)
+            lbl.config(text=self.cfg["walk_steps"][i]["key"])
+        self.start_capture(lbl, done)
+
+    def on_walk_ms(self, i, var):
+        try:
+            v = int(float(var.get().replace(",", ".")))
+        except ValueError:
+            return
+        self.cfg["walk_steps"][i]["ms"] = min(max(v, 10), 10000)
+        save_config(self.cfg)
 
     def test_circle(self):
         if not self.vi:
